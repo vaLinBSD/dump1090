@@ -11,7 +11,7 @@ EXTRACFLAGS=-DHTMLPATH=\"$(SHAREDIR)\"
 .endif
 
 CFLAGS=-O2 -g -Wall -W -I../rtl-sdr/include
-LIBS=-L../rtl-sdr/src/.libs -lrtlsdr -lpthread -lm
+LIBS=-L../rtl-sdr/src/.libs -lrtlsdr -lpthread -lm -lcompat
 CC=gcc
 
 
