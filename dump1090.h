@@ -37,7 +37,7 @@
 // MinorVer changes when additional features are added, but not for bug fixes (range 00-99)
 // DayDate & Year changes for all changes, including for bug fixes. It represent the release date of the update
 //
-#define MODES_DUMP1090_VERSION     "1.07.1908.13"
+#define MODES_DUMP1090_VERSION     "1.07.0710.13"
 
 // ============================= Include files ==========================
 
@@ -64,7 +64,10 @@
 #endif
 
 // ============================= #defines ===============================
-
+//
+// If you have a valid coaa.h, these values will come from it. If not, 
+// then you can enter your own values in the #else section here
+//
 #ifdef USER_LATITUDE
     #define MODES_USER_LATITUDE_DFLT   (USER_LATITUDE)
     #define MODES_USER_LONGITUDE_DFLT  (USER_LONGITUDE)
@@ -159,7 +162,7 @@
 #define MODES_INTERACTIVE_DELETE_TTL   300      // Delete from the list after 300 seconds
 #define MODES_INTERACTIVE_DISPLAY_TTL   60      // Delete from display after 60 seconds
 
-#define MODES_NET_MAX_FD 1024
+#define MODES_NET_MAX_FD             1024
 #define MODES_NET_INPUT_RAW_PORT    30001
 #define MODES_NET_OUTPUT_RAW_PORT   30002
 #define MODES_NET_OUTPUT_SBS_PORT   30003
@@ -181,8 +184,8 @@
 struct client {
     int  fd;                           // File descriptor
     int  service;                      // TCP port the client is connected to
-    char buf[MODES_CLIENT_BUF_SIZE+1]; // Read buffer
     int  buflen;                       // Amount of data on buffer
+    char buf[MODES_CLIENT_BUF_SIZE+1]; // Read buffer
 };
 
 // Structure used to describe an aircraft in iteractive mode
@@ -255,6 +258,9 @@ struct {                             // Internal state
     int            rawOutUsed;                // How much of the buffer is currently used
     char          *beastOut;                  // Buffer for building beast output data
     int            beastOutUsed;              // How much if the buffer is currently used
+#ifdef _WIN32
+    WSADATA        wsaData;                   // Windows socket initialisation
+#endif
 
     // Configuration
     char *filename;                  // Input form file, --ifile option
@@ -405,6 +411,8 @@ void modesInitErrorInfo ();
 struct aircraft* interactiveReceiveData(struct modesMessage *mm);
 void  interactiveShowData(void);
 void  interactiveRemoveStaleAircrafts(void);
+int   decodeBinMessage   (struct client *c, char *p);
+
 //
 // Functions exported from net_io.c
 //
@@ -412,6 +420,7 @@ void modesInitNet         (void);
 void modesReadFromClients (void);
 void modesSendAllClients  (int service, void *msg, int len);
 void modesQueueOutput     (struct modesMessage *mm);
+void modesReadFromClient(struct client *c, char *sep, int(*handler)(struct client *, char *));
 
 #ifdef __cplusplus
 }
