@@ -12,7 +12,7 @@ EXTRACFLAGS=-DHTMLPATH=\"$(SHAREDIR)\"
 
 CFLAGS=-O2 -g -Wall -W `pkg-config --cflags librtlsdr`
 LIBS=-L/usr/local/lib -lrtlsdr -lpthread -lm -lcompat
-CC=gcc
+CC=cc
 
 
 all: dump1090 view1090
