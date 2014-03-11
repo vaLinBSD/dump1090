@@ -37,7 +37,7 @@
 // MinorVer changes when additional features are added, but not for bug fixes (range 00-99)
 // DayDate & Year changes for all changes, including for bug fixes. It represent the release date of the update
 //
-#define MODES_DUMP1090_VERSION     "1.07.0710.13"
+#define MODES_DUMP1090_VERSION     "1.08.1003.14"
 
 // ============================= Include files ==========================
 
@@ -56,6 +56,7 @@
     #include <fcntl.h>
     #include <ctype.h>
     #include <sys/stat.h>
+    #include <sys/ioctl.h>
     #include "rtl-sdr.h"
     #include "anet.h"
 #else
@@ -80,7 +81,7 @@
 #define MODES_DEFAULT_FREQ         1090000000
 #define MODES_DEFAULT_WIDTH        1000
 #define MODES_DEFAULT_HEIGHT       700
-#define MODES_ASYNC_BUF_NUMBER     12
+#define MODES_ASYNC_BUF_NUMBER     16
 #define MODES_ASYNC_BUF_SIZE       (16*16384)                 // 256k
 #define MODES_ASYNC_BUF_SAMPLES    (MODES_ASYNC_BUF_SIZE / 2) // Each sample is 2 bytes
 #define MODES_AUTO_GAIN            -100                       // Use automatic gain
@@ -162,6 +163,9 @@
 #define MODES_INTERACTIVE_DELETE_TTL   300      // Delete from the list after 300 seconds
 #define MODES_INTERACTIVE_DISPLAY_TTL   60      // Delete from display after 60 seconds
 
+#define MODES_NET_HEARTBEAT_RATE       900      // Each block is approx 65mS - default is > 1 min
+
+#define MODES_NET_SERVICES_NUM          6
 #define MODES_NET_MAX_FD             1024
 #define MODES_NET_INPUT_RAW_PORT    30001
 #define MODES_NET_OUTPUT_RAW_PORT   30002
@@ -223,15 +227,21 @@ struct aircraft {
 // Program global state
 struct {                             // Internal state
     pthread_t       reader_thread;
+
     pthread_mutex_t data_mutex;      // Mutex to synchronize buffer access
     pthread_cond_t  data_cond;       // Conditional variable associated
-    uint16_t       *data;            // Raw IQ samples buffer
+    uint16_t       *pData          [MODES_ASYNC_BUF_NUMBER]; // Raw IQ sample buffers from RTL
+    struct timeb    stSystemTimeRTL[MODES_ASYNC_BUF_NUMBER]; // System time when RTL passed us this block
+    int             iDataIn;         // Fifo input pointer
+    int             iDataOut;        // Fifo output pointer
+    int             iDataReady;      // Fifo content count 
+    int             iDataLost;       // Count of missed buffers
+
+    uint16_t       *pFileData;       // Raw IQ samples buffer (from a File)
     uint16_t       *magnitude;       // Magnitude vector
-    struct timeb    stSystemTimeRTL; // System time when RTL passed us the Latest block
     uint64_t        timestampBlk;    // Timestamp of the start of the current block
     struct timeb    stSystemTimeBlk; // System time when RTL passed us currently processing this block
     int             fd;              // --ifile option file descriptor
-    int             data_ready;      // Data ready to be processed
     uint32_t       *icao_cache;      // Recently seen ICAO addresses cache
     uint16_t       *maglut;          // I/Q -> Magnitude lookup table
     int             exit;            // Exit from the main loop when true
@@ -273,6 +283,8 @@ struct {                             // Internal state
     int   debug;                     // Debugging mode
     int   net;                       // Enable networking
     int   net_only;                  // Enable just networking
+    int   net_heartbeat_count;       // TCP heartbeat counter
+    int   net_heartbeat_rate;        // TCP heartbeat rate
     int   net_output_sbs_port;       // SBS output TCP port
     int   net_output_raw_size;       // Minimum Size of the output raw data
     int   net_output_raw_rate;       // Rate (in 64mS increments) of output raw data
@@ -401,7 +413,7 @@ void detectModeS        (uint16_t *m, uint32_t mlen);
 void decodeModesMessage (struct modesMessage *mm, unsigned char *msg);
 void displayModesMessage(struct modesMessage *mm);
 void useModesMessage    (struct modesMessage *mm);
-void computeMagnitudeVector();
+void computeMagnitudeVector(uint16_t *pData);
 void decodeCPR          (struct aircraft *a, int fflag, int surface);
 int  decodeCPRrelative  (struct aircraft *a, int fflag, int surface);
 void modesInitErrorInfo ();

@@ -762,7 +762,7 @@ char *cf_str[8] = {
     /* 1 */ "ADS-B ES/NT device with other address",
     /* 2 */ "Fine format TIS-B",
     /* 3 */ "Coarse format TIS-B",
-    /* 4 */ "TIS-B managment message",
+    /* 4 */ "TIS-B management message",
     /* 5 */ "TIS-B relay of ADS-B message with other address",
     /* 6 */ "ADS-B rebroadcast using DF-17 message format",
     /* 7 */ "Reserved"
@@ -1372,9 +1372,8 @@ void displayModesMessage(struct modesMessage *mm) {
 // Turn I/Q samples pointed by Modes.data into the magnitude vector
 // pointed by Modes.magnitude.
 //
-void computeMagnitudeVector(void) {
+void computeMagnitudeVector(uint16_t *p) {
     uint16_t *m = &Modes.magnitude[MODES_PREAMBLE_SAMPLES+MODES_LONG_MSG_SAMPLES];
-    uint16_t *p = Modes.data;
     uint32_t j;
 
     memcpy(Modes.magnitude,&Modes.magnitude[MODES_ASYNC_BUF_SAMPLES], MODES_PREAMBLE_SIZE+MODES_LONG_MSG_SIZE);
@@ -1813,6 +1812,25 @@ void detectModeS(uint16_t *m, uint32_t mlen) {
         Modes.net_output_raw_rate_count = 0;
         }
       }
+    else if ( (Modes.net) 
+           && (Modes.net_heartbeat_rate) 
+           && ((++Modes.net_heartbeat_count) > Modes.net_heartbeat_rate) ) {
+      //
+      // We haven't received any Mode A/C/S messages for some time. To try and keep any TCP
+      // links alive, send a null frame. This will help stop any routers discarding our TCP 
+      // link which will cause an un-recoverable link error if/when a real frame arrives.   
+      //
+      // Fudge up a null message
+      memset(&mm, 0, sizeof(mm));
+      mm.msgbits      = MODES_SHORT_MSG_BITS;
+      mm.timestampMsg = Modes.timestampBlk;
+
+      // Feed output clients
+      modesQueueOutput(&mm);
+
+      // Reset the heartbeat counter
+      Modes.net_heartbeat_count = 0;
+      }
 }
 //
 //=========================================================================
@@ -1837,6 +1855,9 @@ void useModesMessage(struct modesMessage *mm) {
 
         // Feed output clients
         if (Modes.net) {modesQueueOutput(mm);}
+
+        // Heartbeat not required whilst we're seeing real messages
+        Modes.net_heartbeat_count = 0;
     }
 }
 //

@@ -51,7 +51,7 @@ void modesInitNet(void) {
         char *descr;
         int *socket;
         int port;
-    } services[6] = {
+    } services[MODES_NET_SERVICES_NUM] = {
         {"Raw TCP output", &Modes.ros, Modes.net_output_raw_port},
         {"Raw TCP input", &Modes.ris, Modes.net_input_raw_port},
         {"Beast TCP output", &Modes.bos, Modes.net_output_beast_port},
@@ -64,7 +64,7 @@ void modesInitNet(void) {
     memset(Modes.clients,0,sizeof(Modes.clients));
     Modes.maxfd = -1;
 
-    for (j = 0; j < 6; j++) {
+    for (j = 0; j < MODES_NET_SERVICES_NUM; j++) {
         int s = anetTcpServer(Modes.aneterr, services[j].port, NULL);
         if (s == -1) {
             fprintf(stderr, "Error opening the listening port %d (%s): %s\n",
@@ -96,7 +96,7 @@ void modesAcceptClients(void) {
     services[4] = Modes.https;
     services[5] = Modes.sbsos;
 
-    for (j = 0; j < sizeof(services)/sizeof(int); j++) {
+    for (j = 0; j < MODES_NET_SERVICES_NUM; j++) {
         fd = anetTcpAccept(Modes.aneterr, services[j], NULL, &port);
         if (fd == -1) continue;
 
@@ -146,14 +146,18 @@ void modesFreeClient(int fd) {
     if (Modes.debug & MODES_DEBUG_NET)
         printf("Closing client %d\n", fd);
 
-    // If this was our maxfd, rescan the full clients array to check what's
-    // the new max.
+    // If this was our maxfd, scan the clients array to find trhe new max.
+    // Note that we are sure there is no active fd greater than the closed
+    // fd, so we scan from fd-1 to 0.
     if (Modes.maxfd == fd) {
         int j;
 
         Modes.maxfd = -1;
-        for (j = 0; j < MODES_NET_MAX_FD; j++) {
-            if (Modes.clients[j]) Modes.maxfd = j;
+        for (j = fd-1; j >= 0; j--) {
+            if (Modes.clients[j]) {
+                 Modes.maxfd = j;
+                 break;
+            }
         }
     }
 }
@@ -185,7 +189,9 @@ void modesSendBeastOutput(struct modesMessage *mm) {
     char *p = &Modes.beastOut[Modes.beastOutUsed];
     int  msgLen = mm->msgbits / 8;
     char * pTimeStamp;
+    char ch;
     int  j;
+    int  iOutLen = msgLen + 9; // Escape, msgtype, timestamp, sigLevel, msg
 
     *p++ = 0x1a;
     if      (msgLen == MODES_SHORT_MSG_BYTES)
@@ -199,14 +205,19 @@ void modesSendBeastOutput(struct modesMessage *mm) {
 
     pTimeStamp = (char *) &mm->timestampMsg;
     for (j = 5; j >= 0; j--) {
-        *p++ = pTimeStamp[j];
+        *p++ = (ch = pTimeStamp[j]);
+        if (0x1A == ch) {*p++ = ch; iOutLen++;}
     }
 
-    *p++ = mm->signalLevel;
+    *p++ = (ch = mm->signalLevel);
+    if (0x1A == ch) {*p++ = ch; iOutLen++;}
 
-    memcpy(p, mm->msg, msgLen);
+    for (j = 0; j < msgLen; j++) {
+        *p++ = (ch = mm->msg[j]);
+        if (0x1A == ch) {*p++ = ch; iOutLen++;} 
+    }
 
-    Modes.beastOutUsed += (msgLen + 9);
+    Modes.beastOutUsed +=  iOutLen;
     if (Modes.beastOutUsed >= Modes.net_output_raw_size)
       {
       modesSendAllClients(Modes.bos, Modes.beastOut, Modes.beastOutUsed);
@@ -357,10 +368,10 @@ void modesSendSBSOutput(struct modesMessage *mm) {
     // Field 19 is the Squawk Changing Alert flag (if we have it)
     if (mm->bFlags & MODES_ACFLAGS_FS_VALID) {
         if ((mm->fs >= 2) && (mm->fs <= 4)) {
-            p += sprintf(p, ",-1");  
-        } else {    
+            p += sprintf(p, ",-1");
+        } else {
             p += sprintf(p, ",0");
-        }  
+        }
     } else {
         p += sprintf(p, ",");
     }
@@ -369,7 +380,7 @@ void modesSendSBSOutput(struct modesMessage *mm) {
     if (mm->bFlags & MODES_ACFLAGS_SQUAWK_VALID) {
         if ((mm->modeA == 0x7500) || (mm->modeA == 0x7600) || (mm->modeA == 0x7700)) {
             p += sprintf(p, ",-1");
-        } else {      
+        } else {
             p += sprintf(p, ",0");
         }
     } else {
@@ -379,10 +390,10 @@ void modesSendSBSOutput(struct modesMessage *mm) {
     // Field 21 is the Squawk Ident flag (if we have it)
     if (mm->bFlags & MODES_ACFLAGS_FS_VALID) {
         if ((mm->fs >= 4) && (mm->fs <= 5)) {
-            p += sprintf(p, ",-1");  
-        } else {    
+            p += sprintf(p, ",-1");
+        } else {
             p += sprintf(p, ",0");
-        }  
+        }
     } else {
         p += sprintf(p, ",");
     }
@@ -413,17 +424,19 @@ void modesQueueOutput(struct modesMessage *mm) {
 //=========================================================================
 //
 // This function decodes a Beast binary format message
-// 
+//
 // The message is passed to the higher level layers, so it feeds
 // the selected screen output, the network output and so forth.
-// 
+//
 // If the message looks invalid it is silently discarded.
 //
-// The function always returns 0 (success) to the caller as there is no 
+// The function always returns 0 (success) to the caller as there is no
 // case where we want broken messages here to close the client connection.
 //
 int decodeBinMessage(struct client *c, char *p) {
     int msgLen = 0;
+    int  j;
+    char ch;
     unsigned char msg[MODES_LONG_MSG_BYTES];
     struct modesMessage mm;
     MODES_NOTUSED(c);
@@ -441,16 +454,25 @@ int decodeBinMessage(struct client *c, char *p) {
         // Mark messages received over the internet as remote so that we don't try to
         // pass them off as being received by this instance when forwarding them
         mm.remote      =    1;
-        p += 7;                 // Skip the timestamp       
-        mm.signalLevel = *p++;  // Grab the signal level
-        memcpy(msg, p, msgLen); // and the data
+        for (j = 0; j < 7; j++) { // Skip the message type and timestamp
+            ch = *p++;
+            if (0x1A == ch) {p++;}
+        }
+
+        mm.signalLevel = ch = *p++;  // Grab the signal level
+        if (0x1A == ch) {p++;}
+
+        for (j = 0; j < msgLen; j++) { // and the data
+            msg[j] = ch = *p++;
+            if (0x1A == ch) {p++;}
+        }
 
         if (msgLen == MODEAC_MSG_BYTES) { // ModeA or ModeC
-            decodeModeAMessage(&mm, ((msg[0] << 8) | msg[1])); 
+            decodeModeAMessage(&mm, ((msg[0] << 8) | msg[1]));
         } else {
             decodeModesMessage(&mm, msg);
         }
-    
+
         useModesMessage(&mm);
     }
     return (0);
@@ -733,7 +755,8 @@ int handleHTTPRequest(struct client *c, char *p) {
     }
 
     // Send header and content.
-    if (write(c->fd, hdr, hdrlen) == -1 || write(c->fd, content, clen) == -1) {
+    if ( (write(c->fd, hdr, hdrlen) != hdrlen) 
+      || (write(c->fd, content, clen) != clen) ) {
         free(content);
         return 1;
     }
@@ -762,7 +785,7 @@ void modesReadFromClient(struct client *c, char *sep,
     int nread;
     int fullmsg;
     int bContinue = 1;
-    char *s, *e;
+    char *s, *e, *p;
 
     while(bContinue) {
 
@@ -812,6 +835,15 @@ void modesReadFromClient(struct client *c, char *sep,
                     left = &(c->buf[c->buflen]) - e;
                     continue;
                 }
+                // we need to be careful of double escape characters in the message body
+                for (p = s; p < e; p++) {
+                    if (0x1A == *p) {
+                        p++; e++;
+                        if (e > &(c->buf[c->buflen])) {
+                            break;
+                        }
+                    }
+                }
                 left = &(c->buf[c->buflen]) - e;
                 if (left < 0) {                                // Incomplete message in buffer
                     e = s - 1;                                 // point back at last found 0x1a.
@@ -819,7 +851,7 @@ void modesReadFromClient(struct client *c, char *sep,
                 }
                 // Have a 0x1a followed by 1, 2 or 3 - pass message less 0x1a to handler.
                 if (handler(c, s)) {
-                    modesFreeClient(c->fd);          
+                    modesFreeClient(c->fd);
                     return;
                 }
                 fullmsg = 1;
@@ -834,7 +866,7 @@ void modesReadFromClient(struct client *c, char *sep,
             //
             while ((e = strstr(s, sep)) != NULL) { // end of first message if found
                 *e = '\0';                         // The handler expects null terminated strings
-                if (handler(c, s)) {               // Pass message to handler. 
+                if (handler(c, s)) {               // Pass message to handler.
                     modesFreeClient(c->fd);        // Handler returns 1 on error to signal we .
                     return;                        // should close the client connection
                 }
@@ -842,8 +874,8 @@ void modesReadFromClient(struct client *c, char *sep,
                 fullmsg = 1;
             }
         }
-        
-        if (fullmsg) {                             // We processed something - so 
+
+        if (fullmsg) {                             // We processed something - so
             c->buflen = &(c->buf[c->buflen]) - s;  //     Update the unprocessed buffer length
             memmove(c->buf, s, c->buflen);         //     Move what's remaining to the start of the buffer
         } else {                                   // If no message was decoded process the next client

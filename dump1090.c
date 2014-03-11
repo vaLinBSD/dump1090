@@ -38,6 +38,27 @@ void sigintHandler(int dummy) {
     Modes.exit = 1;           // Signal to threads that we are done
 }
 //
+// =============================== Terminal handling ========================
+//
+#ifndef _WIN32
+// Get the number of rows after the terminal changes size.
+int getTermRows() { 
+    struct winsize w; 
+    ioctl(STDOUT_FILENO, TIOCGWINSZ, &w); 
+    return (w.ws_row); 
+} 
+
+// Handle resizing terminal
+void sigWinchCallback() {
+    signal(SIGWINCH, SIG_IGN);
+    Modes.interactive_rows = getTermRows();
+    interactiveShowData();
+    signal(SIGWINCH, sigWinchCallback); 
+}
+#else 
+int getTermRows() { return MODES_INTERACTIVE_ROWS;}
+#endif
+//
 // =============================== Initialization ===========================
 //
 void modesInitConfig(void) {
@@ -48,13 +69,14 @@ void modesInitConfig(void) {
     Modes.gain                    = MODES_MAX_GAIN;
     Modes.freq                    = MODES_DEFAULT_FREQ;
     Modes.check_crc               = 1;
+    Modes.net_heartbeat_rate      = MODES_NET_HEARTBEAT_RATE;
     Modes.net_output_sbs_port     = MODES_NET_OUTPUT_SBS_PORT;
     Modes.net_output_raw_port     = MODES_NET_OUTPUT_RAW_PORT;
     Modes.net_input_raw_port      = MODES_NET_INPUT_RAW_PORT;
     Modes.net_output_beast_port   = MODES_NET_OUTPUT_BEAST_PORT;
     Modes.net_input_beast_port    = MODES_NET_INPUT_BEAST_PORT;
     Modes.net_http_port           = MODES_NET_HTTP_PORT;
-    Modes.interactive_rows        = MODES_INTERACTIVE_ROWS;
+    Modes.interactive_rows        = getTermRows();
     Modes.interactive_delete_ttl  = MODES_INTERACTIVE_DELETE_TTL;
     Modes.interactive_display_ttl = MODES_INTERACTIVE_DISPLAY_TTL;
     Modes.fUserLat                = MODES_USER_LATITUDE_DFLT;
@@ -71,7 +93,7 @@ void modesInit(void) {
 
     // Allocate the various buffers used by Modes
     if ( ((Modes.icao_cache = (uint32_t *) malloc(sizeof(uint32_t) * MODES_ICAO_CACHE_LEN * 2)                  ) == NULL) ||
-         ((Modes.data       = (uint16_t *) malloc(MODES_ASYNC_BUF_SIZE)                                         ) == NULL) ||
+         ((Modes.pFileData  = (uint16_t *) malloc(MODES_ASYNC_BUF_SIZE)                                         ) == NULL) ||
          ((Modes.magnitude  = (uint16_t *) malloc(MODES_ASYNC_BUF_SIZE+MODES_PREAMBLE_SIZE+MODES_LONG_MSG_SIZE) ) == NULL) ||
          ((Modes.maglut     = (uint16_t *) malloc(sizeof(uint16_t) * 256 * 256)                                 ) == NULL) ||
          ((Modes.beastOut   = (char     *) malloc(MODES_RAWOUT_BUF_SIZE)                                        ) == NULL) ||
@@ -83,7 +105,7 @@ void modesInit(void) {
 
     // Clear the buffers that have just been allocated, just in-case
     memset(Modes.icao_cache, 0,   sizeof(uint32_t) * MODES_ICAO_CACHE_LEN * 2);
-    memset(Modes.data,       127, MODES_ASYNC_BUF_SIZE);
+    memset(Modes.pFileData,127,   MODES_ASYNC_BUF_SIZE);
     memset(Modes.magnitude,  0,   MODES_ASYNC_BUF_SIZE+MODES_PREAMBLE_SIZE+MODES_LONG_MSG_SIZE);
 
     // Validate the users Lat/Lon home location inputs
@@ -112,8 +134,9 @@ void modesInit(void) {
       {Modes.net_output_raw_rate = MODES_RAWOUT_BUF_RATE;}
 
     // Initialise the Block Timers to something half sensible
-    ftime(&Modes.stSystemTimeRTL);
-    Modes.stSystemTimeBlk         = Modes.stSystemTimeRTL;
+    ftime(&Modes.stSystemTimeBlk);
+    for (i = 0; i < MODES_ASYNC_BUF_NUMBER; i++)
+      {Modes.stSystemTimeRTL[i] = Modes.stSystemTimeBlk;}
 
     // Each I and Q value varies from 0 to 255, which represents a range from -1 to +1. To get from the 
     // unsigned (0-255) range you therefore subtract 127 (or 128 or 127.5) from each I and Q, giving you 
@@ -229,13 +252,33 @@ void rtlsdrCallback(unsigned char *buf, uint32_t len, void *ctx) {
 
     MODES_NOTUSED(ctx);
 
+    // Lock the data buffer variables before accessing them
     pthread_mutex_lock(&Modes.data_mutex);
-    ftime(&Modes.stSystemTimeRTL);
-    if (len > MODES_ASYNC_BUF_SIZE) len = MODES_ASYNC_BUF_SIZE;
-    // Read the new data
-    memcpy(Modes.data, buf, len);
-    Modes.data_ready = 1;
-    // Signal to the other thread that new data is ready
+
+    Modes.iDataIn &= (MODES_ASYNC_BUF_NUMBER-1); // Just incase!!!
+
+    // Get the system time for this block
+    ftime(&Modes.stSystemTimeRTL[Modes.iDataIn]);
+
+    if (len > MODES_ASYNC_BUF_SIZE) {len = MODES_ASYNC_BUF_SIZE;}
+
+    // Queue the new data
+    Modes.pData[Modes.iDataIn] = (uint16_t *) buf;
+    Modes.iDataIn    = (MODES_ASYNC_BUF_NUMBER-1) & (Modes.iDataIn + 1);
+    Modes.iDataReady = (MODES_ASYNC_BUF_NUMBER-1) & (Modes.iDataIn - Modes.iDataOut);   
+
+    if (Modes.iDataReady == 0) {
+      // Ooooops. We've just received the MODES_ASYNC_BUF_NUMBER'th outstanding buffer
+      // This means that RTLSDR is currently overwriting the MODES_ASYNC_BUF_NUMBER+1
+      // buffer, but we havent yet processed it, so we're going to lose it. There
+      // isn't much we can do to recover the lost data, but we can correct things to
+      // avoid any additional problems.
+      Modes.iDataOut   = (MODES_ASYNC_BUF_NUMBER-1) & (Modes.iDataOut+1);
+      Modes.iDataReady = (MODES_ASYNC_BUF_NUMBER-1);   
+      Modes.iDataLost++;
+    }
+ 
+    // Signal to the other thread that new data is ready, and unlock
     pthread_cond_signal(&Modes.data_cond);
     pthread_mutex_unlock(&Modes.data_mutex);
 }
@@ -247,13 +290,12 @@ void rtlsdrCallback(unsigned char *buf, uint32_t len, void *ctx) {
 //
 void readDataFromFile(void) {
     pthread_mutex_lock(&Modes.data_mutex);
-    while(1) {
+    while(Modes.exit == 0) {
         ssize_t nread, toread;
         unsigned char *p;
 
-        if (Modes.exit == 1) break;
-        if (Modes.data_ready) {
-            pthread_cond_wait(&Modes.data_cond,&Modes.data_mutex);
+        if (Modes.iDataReady) {
+            pthread_cond_wait(&Modes.data_cond, &Modes.data_mutex);
             continue;
         }
 
@@ -266,7 +308,7 @@ void readDataFromFile(void) {
         }
 
         toread = MODES_ASYNC_BUF_SIZE;
-        p = (unsigned char *) Modes.data;
+        p = (unsigned char *) Modes.pFileData;
         while(toread) {
             nread = read(Modes.fd, p, toread);
             if (nread <= 0) {
@@ -280,7 +322,17 @@ void readDataFromFile(void) {
             // Not enough data on file to fill the buffer? Pad with no signal.
             memset(p,127,toread);
         }
-        Modes.data_ready = 1;
+
+        Modes.iDataIn &= (MODES_ASYNC_BUF_NUMBER-1); // Just incase!!!
+
+        // Get the system time for this block
+        ftime(&Modes.stSystemTimeRTL[Modes.iDataIn]);
+
+        // Queue the new data
+        Modes.pData[Modes.iDataIn] = Modes.pFileData;
+        Modes.iDataIn    = (MODES_ASYNC_BUF_NUMBER-1) & (Modes.iDataIn + 1);
+        Modes.iDataReady = (MODES_ASYNC_BUF_NUMBER-1) & (Modes.iDataIn - Modes.iDataOut);   
+
         // Signal to the other thread that new data is ready
         pthread_cond_signal(&Modes.data_cond);
     }
@@ -302,7 +354,6 @@ void *readerThreadEntryPoint(void *arg) {
         readDataFromFile();
     }
     // Signal to the other thread that new data is ready - dummy really so threads don't mutually lock
-    Modes.data_ready = 1;
     pthread_cond_signal(&Modes.data_cond);
     pthread_mutex_unlock(&Modes.data_mutex);
 #ifndef _WIN32
@@ -362,7 +413,8 @@ void showHelp(void) {
 "--net-bo-port <port>     TCP Beast output listen port (default: 30005)\n"
 "--net-ro-size <size>     TCP raw output minimum size (default: 0)\n"
 "--net-ro-rate <rate>     TCP raw output memory flush rate (default: 0)\n"
-"--lat <latitude>         Reference/receiver latitide for surface posn (opt)\n"
+"--net-heartbeat <rate>   TCP heartbeat rate in seconds (default: 60 sec)\n"
+"--lat <latitude>         Reference/receiver latitude for surface posn (opt)\n"
 "--lon <longitude>        Reference/receiver longitude for surface posn (opt)\n"
 "--fix                    Enable single-bits error correction using CRC\n"
 "--no-fix                 Disable single-bits error correction using CRC\n"
@@ -453,7 +505,9 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[j],"--net-only")) {
             Modes.net = 1;
             Modes.net_only = 1;
-        } else if (!strcmp(argv[j],"--net-ro-size") && more) {
+       } else if (!strcmp(argv[j],"--net-heartbeat") && more) {
+            Modes.net_heartbeat_rate = atoi(argv[++j]) * 15;
+       } else if (!strcmp(argv[j],"--net-ro-size") && more) {
             Modes.net_output_raw_size = atoi(argv[++j]);
         } else if (!strcmp(argv[j],"--net-ro-rate") && more) {
             Modes.net_output_raw_rate = atoi(argv[++j]);
@@ -532,12 +586,13 @@ int main(int argc, char **argv) {
         }
     }
 
+#ifndef _WIN32
+    // Setup for SIGWINCH for handling lines
+    if (Modes.interactive) {signal(SIGWINCH, sigWinchCallback);}
+#endif
+
     // Initialization
     modesInit();
-
-    //if (Modes.debug & MODES_DEBUG_BADCRC) {
-	//    testAndTimeBitCorrection();
-    //}
 
     if (Modes.net_only) {
         fprintf(stderr,"Net-only mode, no RTL device or file open.\n");
@@ -563,31 +618,54 @@ int main(int argc, char **argv) {
 
     // Create the thread that will read the data from the device.
     pthread_create(&Modes.reader_thread, NULL, readerThreadEntryPoint, NULL);
-
     pthread_mutex_lock(&Modes.data_mutex);
-    while(1) {
-        if (!Modes.data_ready) {
-            pthread_cond_wait(&Modes.data_cond,&Modes.data_mutex);
-            continue;
+
+    while (Modes.exit == 0) {
+
+        if (Modes.iDataReady == 0) {
+            pthread_cond_wait(&Modes.data_cond,&Modes.data_mutex); // This unlocks Modes.data_mutex, and waits for Modes.data_cond 
+            continue;                                              // Once (Modes.data_cond) occurs, it locks Modes.data_mutex
         }
-        computeMagnitudeVector();
-        Modes.stSystemTimeBlk = Modes.stSystemTimeRTL;
 
-        // Signal to the other thread that we processed the available data
-        // and we want more (useful for --ifile)
-        Modes.data_ready = 0;
-        pthread_cond_signal(&Modes.data_cond);
+        // Modes.data_mutex is Locked, and (Modes.iDataReady != 0)
+        if (Modes.iDataReady) { // Check we have new data, just in case!!
+ 
+            Modes.iDataOut &= (MODES_ASYNC_BUF_NUMBER-1); // Just incase
 
-        // Process data after releasing the lock, so that the capturing
-        // thread can read data while we perform computationally expensive
-        // stuff * at the same time. (This should only be useful with very
-        // slow processors).
-        pthread_mutex_unlock(&Modes.data_mutex);
-        detectModeS(Modes.magnitude, MODES_ASYNC_BUF_SAMPLES);
-        Modes.timestampBlk += (MODES_ASYNC_BUF_SAMPLES*6);
+            // Translate the next lot of I/Q samples into Modes.magnitude
+            computeMagnitudeVector(Modes.pData[Modes.iDataOut]);
+
+            Modes.stSystemTimeBlk = Modes.stSystemTimeRTL[Modes.iDataOut];
+
+            // Update the input buffer pointer queue
+            Modes.iDataOut   = (MODES_ASYNC_BUF_NUMBER-1) & (Modes.iDataOut + 1); 
+            Modes.iDataReady = (MODES_ASYNC_BUF_NUMBER-1) & (Modes.iDataIn - Modes.iDataOut);   
+
+            // If we lost some blocks, correct the timestamp
+            if (Modes.iDataLost) {
+                Modes.timestampBlk += (MODES_ASYNC_BUF_SAMPLES * 6 * Modes.iDataLost);
+                Modes.iDataLost = 0;
+            }
+
+            // It's safe to release the lock now
+            pthread_cond_signal (&Modes.data_cond);
+            pthread_mutex_unlock(&Modes.data_mutex);
+
+            // Process data after releasing the lock, so that the capturing
+            // thread can read data while we perform computationally expensive
+            // stuff at the same time.
+            detectModeS(Modes.magnitude, MODES_ASYNC_BUF_SAMPLES);
+
+            // Update the timestamp ready for the next block
+            Modes.timestampBlk += (MODES_ASYNC_BUF_SAMPLES*6);
+
+        } else {
+            pthread_cond_signal (&Modes.data_cond);
+            pthread_mutex_unlock(&Modes.data_mutex);
+        }
+
         backgroundTasks();
         pthread_mutex_lock(&Modes.data_mutex);
-        if (Modes.exit) break;
     }
 
     // If --stats were given, print statistics
@@ -632,7 +710,11 @@ int main(int argc, char **argv) {
     pthread_cond_destroy(&Modes.data_cond);     // Thread cleanup
     pthread_mutex_destroy(&Modes.data_mutex);
     pthread_join(Modes.reader_thread,NULL);     // Wait on reader thread exit
+#ifndef _WIN32
     pthread_exit(0);
+#else
+    return (0);
+#endif
 }
 //
 //=========================================================================
